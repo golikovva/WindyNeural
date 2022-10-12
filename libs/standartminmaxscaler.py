@@ -3,14 +3,73 @@ import torch
 
 class MyStandartScaler:
     def __init__(self):
+        self.channel_means = None
+        self.channel_stddevs = None
+        self.channels = None
         self.mean = None
         self.stddev = None
+        self.channels_dim = None
 
     def fit_transform(self, tensor):
         self.mean = tensor.mean(0, keepdim=True)
         self.stddev = tensor.std(0, unbiased=False, keepdim=True)
         tensor -= self.mean
         tensor /= self.stddev
+        return tensor
+
+    def channel_fit_transform(self, tensor, channels=None, channels_dim=1):
+        self.channels_dim = channels_dim
+        self.channel_means = []
+        self.channel_stddevs = []
+        if not channels:
+            self.channels = range(tensor.shape[1])
+        else:
+            self.channels = channels
+        tensor = torch.split(tensor, 1, dim=channels_dim)
+        for i, channel in enumerate(tensor):
+            if i in self.channels:
+                self.channel_means.append(torch.mean(channel))
+                self.channel_stddevs.append(torch.std(channel))
+                channel -= self.channel_means[-1]
+                channel /= self.channel_stddevs[-1]
+        tensor = torch.cat(tensor, dim=channels_dim)
+        return tensor
+
+    def channel_inverse_transform(self, tensor, channels_dim=None):
+        if not channels_dim:
+            channels_dim = self.channels_dim
+        tensor = list(torch.split(tensor, 1, dim=channels_dim))
+        for i in range(len(self.channels)):
+            tensor[self.channels[i]] = tensor[self.channels[i]] * self.channel_stddevs[i]
+            tensor[self.channels[i]] = tensor[self.channels[i]] + self.channel_means[i]
+        tensor = torch.cat(tensor, dim=channels_dim)
+        return tensor
+
+    def channel_fit(self, tensor, channels=None, channels_dim=1):
+        self.channels_dim = channels_dim
+        self.channel_means = []
+        self.channel_stddevs = []
+        if not channels:
+            self.channels = range(tensor.shape[1])
+        else:
+            self.channels = channels
+        tensor = torch.split(tensor, 1, dim=self.channels_dim)
+        for i, channel in enumerate(tensor):
+            if i in self.channels:
+                self.channel_means.append(torch.mean(channel))
+                self.channel_stddevs.append(torch.std(channel))
+
+    def channel_transform(self, tensor, channels_dim=None):
+        if not channels_dim:
+            channels_dim = self.channels_dim
+        tensor = torch.split(tensor, 1, dim=channels_dim)
+        j = 0
+        for i, channel in enumerate(tensor):
+            if i in self.channels:
+                channel -= self.channel_means[j]
+                channel /= self.channel_stddevs[j]
+                j += 1
+        tensor = torch.cat(tensor, dim=channels_dim)
         return tensor
 
     def fit(self, tensor):
@@ -42,8 +101,8 @@ class MyMinMaxScaler:
         self.range_max = feature_range[1]
         self.tensor_min = None
         self.tensor_max = None
-        self.channel_mins = None
-        self.channel_maxs = None
+        self.channel_mins = []
+        self.channel_maxs = []
 
     def channel_fit_transform(self, tensor):
         self.channel_mins = []

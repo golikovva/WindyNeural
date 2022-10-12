@@ -1,6 +1,16 @@
 import numpy as np
 import torch
 from imgaug import augmenters as iaa
+from standartminmaxscaler import *
+
+
+class StationNormalNoize(object):
+    def __init__(self, mean=0, std=1):
+        self.mean = mean
+        self.std = std
+
+    def __call__(self, x):
+        return x+torch.normal(self.mean, self.std, size=x.shape)
 
 
 def additive_gauss_noise(images, mean=0, var=0.01, mask_size=(10, 10, 3)):

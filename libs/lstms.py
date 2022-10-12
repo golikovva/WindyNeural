@@ -2,8 +2,8 @@ import torch.nn as nn
 import torch
 from torch.autograd import Variable
 import torchvision.models as models
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = "cpu"
 
 class UnifiedLSTM(nn.Module):
     """Same as SepLSTM_2dir but sin and cos are restricted manually to satisfy basic trigonometric identity"""
@@ -16,8 +16,12 @@ class UnifiedLSTM(nn.Module):
         self.station_size = station_input_size
         self.forecast_range = forecast_range
         self.station_scaler = station_scaler
-        self.station_scaler.mean = self.station_scaler.mean.to(device)
-        self.station_scaler.stddev = self.station_scaler.stddev.to(device)
+        for channels in self.station_scaler.channel_means:
+            channels.cuda()
+        for channels in self.station_scaler.channel_stddevs:
+            channels.cuda()
+        # self.station_scaler.channel_means = self.station_scaler.channel_means.to(device)
+        # self.station_scaler.stddev = self.station_scaler.stddev.to(device)
 
         self.fea_model = models.resnet18()
         # Here we rebuild ResNet feature model to input 12 channels
@@ -84,8 +88,8 @@ class UnifiedLSTM(nn.Module):
         out = self.softplus2(out)
         out = self.fc_1(out)
         out = out.view(-1, self.forecast_range, self.station_size)
-
-        out = self.station_scaler.inverse_transform(out)
+        print(out.shape, 'lstm stat shape')
+        out = self.station_scaler.channel_inverse_transform(out)
         speed, direction = torch.split(out, [1, 2], dim=2)
         l2norm = torch.sqrt(torch.sum(torch.square(direction), 2)).unsqueeze(2)
         direction = direction / l2norm
