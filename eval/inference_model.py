@@ -73,6 +73,7 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
     [min lat, max lat, h]
     lon_bounds - список из 3 значений - восточная и западная долготы ограничивающие домен gfs и w размер домена по ширине
     [min lon, max lon, w]
+    по умолчанию gfs для коррекции линейно интерполируется в центр домена
      Пример использования функции:
         gfs_field = np.load(f"./GFS_falconara_15011500-22042412_14param_test.npy")
         gfs_field = torch.from_numpy(gfs_field)
