@@ -20,45 +20,77 @@ from libs.stationsdata import *
 
 def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, station_coords=None, lat_bounds=None,
                     lon_bounds=None):
-    '''data required shape: gfs - station_number x sequence_length+forecast_range x h x w x 3
+    '''data required shape: gfs - station_number x sequence_length+forecast_range x channels number x h x w
                             station - station_number x sequence_length x 3
                             for station 3 values expected: wind speed module, sin(alpha), cos(alpha),
                             where alpha means angle measured in clockwise direction between true north
                             and the direction from which the wind is blowing.
     '''
-    '''gfs_field - поле значений gfs вокруг станции. размер поля h на w задается из геофизических соображений. Например, для данных ERA5 было выбрано h=w=72,
-    что эквивалентно 72/4=18 градусам - характерный размер мезомасштабных процессов. Необходимы данные скорости ветра по широте, скорости ветра по долготе,
-    давления на уровне моря - 3 канала данных
-    Итого, размер тензора в определеный момент времени 3 x h x w
-    station_seq - измерение модуля скорости ветра (скаляр) на станции за последние 72 часа
-    Подразумевается, что данные нескольких станций могут обрабатываться одной моделью. Их количество обозначим - station_number
-    Нейросети требуются данные ветра со станции и gfs за последние 72 часа. Для разных моделей эта цифра может отличаться, поэтому обозначим её как sequence_length
+    '''gfs_field - поле значений gfs вокруг станции. размер поля h на w задается из геофизических соображений. Например,
+    для данных ERA5 было выбрано h=w=72, что эквивалентно 72/4=18 градусам - характерный размер мезомасштабных
+    процессов. В зависимости от выбранной нейросетевой модели количество необходимых данных может меняться. Например,
+    могут нейросети могут быть необходимы данные о скорости ветра, синусе и косинусе его направления на нескольких
+    изобарических высотах, давлении на уровне моря, и температуре воздуха у поверхности. 
+    В сумме 3 * кол-во высот + 2 канала данных (обозначим channels). 
+    Итого, размер тензора gfs поля в определеный момент времени channels x h x w.
+    Нейросеть строит свой прогноз как коррекцию прогноза gfs. для этого ей в параметре wind_forecast_channels нужно
+    передать список порядковых номеров каналов gfs со скоростью и тригонометрией ветра наиболее коррелирующими
+    с показаниями станции.
+    Например для следующих параметров gfs...
+    parameters_gfs = [
+        'levels_250_speed',
+        'levels_250_sin',
+        'levels_250_cos',
+        'levels_500_speed',
+        'levels_500_sin',
+        'levels_500_cos',
+        'levels_1000_cos',
+        'levels_1000_sin',
+        'levels_1000_cos',
+        'PRSML',
+        'TMP'
+    ]
+    нужно указать wind_forecast_channels = [6, 7, 8] - индексы данных прогноза ветра на высоте 1000gpa
+    station_seq - измерение модуля скорости ветра (скаляр) и тригонометрии его направления на станции
+    за последние 72 часа
+    
+    Подразумевается, что данные нескольких станций могут обрабатываться одной моделью.
+    Их количество обозначим - station_number
+    Нейросети требуются данные ветра со станции и gfs за последние 72 часа. Для разных моделей эта цифра может
+    отличаться, поэтому обозначим её как sequence_length
     Также необходим проноз численной модели gfs на 6 часов вперед. Дальность прогноза обозначим forecast_range
     Таким образом требуемые размеры входных тензоров:
-                            gfs - station_number x sequence_length+forecast_range x 3 x h x w
+                            gfs - station_number x sequence_length+forecast_range x channels x h x w
                             station - station_number x sequence_length x 3
                             station_number - количество станций, с которых собираются данные для модели
-                            3 - модуль скорости ветра на станции, sin(alpha), cos(alpha), где alpha - угол, измеренный против часовой стрелки, между направлением
+                            3 - модуль скорости ветра на станции, sin(alpha), cos(alpha), где alpha - угол,
+                            измеренный против часовой стрелки, между направлением
                             на север и направлением откуда дует ветер
-    inference_mode - зависит от весов нейронной сети. каждой сети подходит только одно значение inference_mode.
-        full_angle - выставить, если сеть предсказывает полный угол(sin, cos) - направление ветра
-        persistence_correction - выставить, если сеть предсказывает коррекцию прогноза модели persistence
-
+                            
+    необязательные параметры station_coords, lat_bounds, lon_bounds нужны для интерполяции поля gfs в координату станции
+    station_coords - список из координат станций - списков из 2 значений
+    lat_bounds - список из 3 значений - южная и северная широты ограничивающие домен gfs и h размер домена по высоте. 
+    [min lat, max lat, h]
+    lon_bounds - список из 3 значений - восточная и западная долготы ограничивающие домен gfs и w размер домена по ширине
+    [min lon, max lon, w]
      Пример использования функции:
-        gfs_field = np.load("/path/to/file").astype(np.float32) #набор данных gfs с 15 года. Размер 63757 х 3 x 72 х 72
+        gfs_field = np.load(f"./GFS_falconara_15011500-22042412_14param_test.npy")
         gfs_field = torch.from_numpy(gfs_field)
-        target = np.load("/path/to/file") #набор измерений модуля скорости ветра с 15 года в м/с. Размер 63757 x 3
-        target = torch.from_numpy(target)
-        gfs_sample = era_field[-78:] #берем последовательность из 78 элементов. -72 назад и +6 прогноз вперед
-        gfs_sample = torch.unsqueeze(gfs_sample, 0) #station_number = 1, значит приводим к виду 1 x 78 x 3 x 72 x 72
-        station_sample = target[-78:-6] # данные со станции за последние 72 часа 
-        station_sample = torch.unsqueeze(station_sample, 0) #station_number = 1, значит приводим к виду 1 x 72 x 3
-
-        from time import time
-        start = time()
-        print(inference_model(gfs_sample, station_sample, './models/gfsdirLSTM.pth')) #применяем функцию. 'MPLSTMaug02' - путь к модели.
-                                                                          #на выходе имеем прогноз модуля скорости ветра на 1-6 часов вперед. Размер 1 x 6
-        print(time()-start)
+        stations = np.load(f"./4stations_test.npy")
+        stations = torch.from_numpy(stations)
+        # gfs_field
+        gfs_field = gfs_field[:78]
+        gfs_field = torch.stack((gfs_field, gfs_field, gfs_field, gfs_field))
+        stations = stations[:, :72]
+    
+        print(stations.shape)  # torch.Size([4, 72, 3])
+        print(gfs_field.shape)  # torch.Size([4, 78, 14, 80, 80])
+        station_coords = [[43.61, 13.36], [43.52, 12.73], [43.09, 12.51], [44.02, 12.61]]
+        lat_bounds = [33.75, 53.5, 80]
+        lon_bounds = [3.5, 23.25, 80]
+        wind_forecast_channels = [9, 10, 11]
+        pred = inference_model(gfs_field, stations, './epochs/unilstm_epoch_10.pth', wind_forecast_channels
+                               , station_coords, lat_bounds, lon_bounds)
     '''
     channels_number = gfs_field.shape[1]
     print(channels_number, 'channels got')
