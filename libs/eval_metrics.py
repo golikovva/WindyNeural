@@ -1,5 +1,6 @@
 import numpy as np
 
+
 def weight_speed_vector(weighting_speed, true_speed):
     assert weighting_speed.shape == true_speed.shape, 'be sure vectors have the same shape'
     weighting_speed[true_speed[:, :] < 4] = weighting_speed[true_speed[:, :] < 4] * 0.25

@@ -16,8 +16,8 @@ from libs.trig_math import *
 from libs.stationsdata import *
 
 
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# device = "cpu"
 def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, station_coords=None, lat_bounds=None,
                     lon_bounds=None):
     '''data required shape: gfs - station_number x sequence_length+forecast_range x channels number x h x w
@@ -111,7 +111,7 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
     lstm = UnifiedLSTM(input_size, station_params_number, hidden_size, num_layers,
                        gfs_params_number, forecast_range, targetss)
     lstm.load_state_dict(torch.load(model_path))
-    lstm.cpu()
+    lstm.to(device)
     lstm.eval()
     if not lat_bounds or not lon_bounds or not station_coords:
         print('Station or gfs coords are not specified. Assuming station is in the gfs field center...')
@@ -135,13 +135,14 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         for t in range(forecast_range):
             for p in range(2):
                 falconara_points[s, t, p] = np.array([s, t, p] + station_coords[s])
-
+    gfs_field = gfs_field.to(device)
+    station_seq = station_seq.to(device)
     corr = lstm(gfs_field, station_seq)
     corr = corr.cpu().detach().numpy()
     gfs_field = gfsss.channel_inverse_transform(gfs_field, 2)
 
     # prepare gfs forecast
-    gfs_forecast = gfs_field[:, -6:, wind_forecast_channels, 35:45, 35:45].detach().numpy()
+    gfs_forecast = gfs_field[:, -6:, wind_forecast_channels, 35:45, 35:45].cpu().detach().numpy()
     # decided to interpolate angle so convert sin/cos to angle
     gfs_angle = np.arctan2(gfs_forecast[:, :, 1], gfs_forecast[:, :, 2])
     # unwrap angles

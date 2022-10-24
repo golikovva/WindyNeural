@@ -2,8 +2,8 @@ import torch.nn as nn
 import torch
 from torch.autograd import Variable
 import torchvision.models as models
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = "cpu"
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# device = "cpu"
 
 class UnifiedLSTM(nn.Module):
     """Same as SepLSTM_2dir but sin and cos are restricted manually to satisfy basic trigonometric identity"""
@@ -17,9 +17,9 @@ class UnifiedLSTM(nn.Module):
         self.forecast_range = forecast_range
         self.station_scaler = station_scaler
         for channels in self.station_scaler.channel_means:
-            channels.cuda()
+            channels.to(device)
         for channels in self.station_scaler.channel_stddevs:
-            channels.cuda()
+            channels.to(device)
         # self.station_scaler.channel_means = self.station_scaler.channel_means.to(device)
         # self.station_scaler.stddev = self.station_scaler.stddev.to(device)
 
