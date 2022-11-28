@@ -26,6 +26,6 @@ def proj_to_trig(x, y):
     # eq0 = np.all(np.array([x == 0, y == 0]))
     sin[np.where(np.isnan(sin))] = 0
     cos[np.where(np.isnan(cos))] = 0
-    print(np.argwhere(np.isnan(sin)), 'found nan indices')
+    # print(np.argwhere(np.isnan(sin)), 'found nan indices')
 
     return speed, sin, cos

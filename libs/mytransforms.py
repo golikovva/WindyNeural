@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from imgaug import augmenters as iaa
-from standartminmaxscaler import *
+# from standartminmaxscaler import *
 
 
 class StationNormalNoize(object):

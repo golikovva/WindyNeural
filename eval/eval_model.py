@@ -2,13 +2,11 @@ import argparse
 import os
 import sys
 
+import torch
+
 sys.path.insert(0, './')
 
-import numpy as np
-import torch.nn as nn
-from torch.autograd import Variable
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
 from scipy.interpolate import RegularGridInterpolator
 from matplotlib import pyplot as plt
 
@@ -16,13 +14,121 @@ from tqdm import tqdm
 
 # from libs import mytransforms
 from libs.standartminmaxscaler import *
-from libs.lstms import UnifiedLSTM
+from model.models import UnifiedLSTM
 from libs.mydatasets import WindDataset
-from libs.stationsdata import stations_data
+from config.stationsdata import stations_data
 from libs.trig_math import proj_to_trig
 from libs.eval_metrics import *
+from main import *
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def test(args):
+    cfg = Config.fromfile(args.config_file)
+    dataset = MPWindDataset(args.val_gfs_files, args.target_dir, args.sequence_length,
+                            args.forecast_range, args.batch_size,
+                            test_mode=True)
+    test_steps = len(dataset) // args.batch_size + 1
+    batches_queue_length = min(test_steps, 16)
+    model = build_model(args.model_type, cfg.model, station_scaler=dataset.targetss)
+    state_dict = torch.load('./epochs/unilstm_best_epoch_88.pth')
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    criterion = torch.nn.MSELoss()  # mean-squared error for regression
+    criterion.cuda()
+    val_batches_queue = Queue(maxsize=batches_queue_length)
+    val_cuda_batches_queue = Queue(maxsize=4)
+    val_thread_killer = thread_killer()
+    val_thread_killer.set_tokill(False)
+
+    for _ in range(args.num_workers):
+        thr = Thread(target=threaded_batches_feeder, args=(val_thread_killer, val_batches_queue, dataset))
+        thr.start()
+    val_cuda_transfers_thread_killer = thread_killer()
+    val_cuda_transfers_thread_killer.set_tokill(False)
+    val_cudathread = Thread(target=threaded_cuda_batches, args=(
+        val_cuda_transfers_thread_killer, val_cuda_batches_queue, val_batches_queue, args.sequence_length))
+    val_cudathread.start()
+
+    model.eval()
+    with torch.no_grad():
+        val_loss_avg = 0
+        forecast_stat = []
+        gfs_forecast_stat = []
+        target_stat = []
+        for batch_idx in tqdm(range(test_steps), total=test_steps):
+            gfs_seq, station_seq, target, true_forecast = val_cuda_batches_queue.get(block=True)
+            y = model(gfs_seq, station_seq)
+            target = dataset.targetss.channel_inverse_transform(target, channels_dim=2)
+            # target = dataset.targetss.channel_inverse_transform(target, 2)
+            loss = criterion(y, true_forecast)
+            val_loss_avg += loss.item()
+
+            interpolator = dataset.interpolators[0]
+            xidx = interpolator.idxx
+            yidx = interpolator.idxy
+            gfs_seq = dataset.gfsss.channel_inverse_transform(gfs_seq, channels_dim=2)
+
+            forecast = gfs_seq[:, -6:, dataset.ground_wind, xidx:xidx+2, yidx:yidx+2]
+            forecast = dataset.interpolators[0].interpolate(forecast)
+
+            predict = torch.zeros_like(y)
+            for j in range(6):
+                # sin(pred) = cos(corr)sin(gfs)+cos(gfs)sin(corr)
+                predict[:, j, 1] = forecast[:, j, 1] * y[:, j, 2] + forecast[:, j, 2] * y[:, j, 1]
+                # cos(pred) = cos(gfs)cos(corr)-sin(gfs)sin(corr)
+                predict[:, j, 2] = y[:, j, 2] * forecast[:, j, 2] - y[:, j, 1] * forecast[:, j, 1]
+            predict[:, :, 0] = y[:, :, 0] + forecast[:, :, 0]
+            forecast_stat.append(predict[:, :, 0].cpu().detach())
+            gfs_forecast_stat.append((forecast[:, :, 0].cpu().detach()))
+            target_stat.append(target[:, :, 0].cpu().detach())
+
+            show_images = False
+            if show_images:
+                plt.figure(figsize=(4, 3), dpi=100)
+                plt.plot(predict[:, 5, 0].cpu().detach(), label='pred Data')  # actual plot
+                plt.plot(forecast[:, 5, 0].cpu().detach(), label='gfs forecast')  # actual plot
+                plt.plot(target[:, 5, 0].cpu().detach(), label='target Data')  # predicted plot
+                plt.plot(y[:, 5, 0].cpu().detach(), label='corr')
+                plt.title('Time-Series Prediction')
+                plt.legend()
+                # plt.show()
+                plt.savefig(f'result_5h_{batch_idx}idx')
+                batch_idx += 1
+                if batch_idx > 5:
+                    break
+
+        avg_loss = val_loss_avg / test_steps
+        losses_dict = {'avg_loss': avg_loss}
+        print('LSTM metrics')
+        forecast = np.concatenate(forecast_stat, 0)
+        target = np.concatenate(target_stat, 0)
+        # print(forecast[:60, 5], target[:60, 5])
+        calc_wRMSE(forecast, target)
+        forecast = np.concatenate(forecast_stat, 0)
+        target = np.concatenate(target_stat, 0)
+        calc_cat_change_metric(forecast, target)
+        print('GFS metrics')
+        forecast = np.concatenate(gfs_forecast_stat, 0)
+        target = np.concatenate(target_stat, 0)
+        # print(forecast[:60, 5], target[:60, 5])
+        calc_wRMSE(forecast, target)
+        forecast = np.concatenate(gfs_forecast_stat, 0)
+        target = np.concatenate(target_stat, 0)
+        calc_cat_change_metric(forecast, target)
+
+        val_thread_killer.set_tokill(True)
+        val_cuda_transfers_thread_killer.set_tokill(True)
+        for _ in range(args.num_workers):
+            try:
+                # Enforcing thread shutdown
+                val_batches_queue.get(block=True, timeout=1)
+                val_cuda_batches_queue.get(block=True, timeout=1)
+            except Empty:
+                pass
+        return losses_dict
 
 
 def main(args):
@@ -145,13 +251,6 @@ def main(args):
         # predict[:, :, 0] = corr[:, :, 0] + forecast[:, :, 0]
         predict[:, :, 0] = forecast[:, :, 0]
         print(corr[:50, :, 0])
-        # predict = predict.cpu().detach()
-        #     target = target.cpu().detach()
-
-        #     pred_speed, pred_angle = tensor_proj_to_angle(pred[:, :, 0], pred[:, :, 1])
-        #     target_speed, target_angle = tensor_proj_to_angle(target[:, :, 0], target[:, :, 1])
-        #     forecast_stat.append(pred_speed)
-        #     target_stat.append(target_speed)
 
         forecast_stat.append(predict[:, :, 0])
         target_stat.append(target[:, :, 0])
@@ -180,8 +279,16 @@ def main(args):
     # target = torch.cat(target_stat, 0)
 
 
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='')
+    parser.add_argument(
+        "--config-file",
+        default="./train_config.py",
+        metavar="FILE",
+        help="path to config file",
+        type=str,
+    )
 
     '''
     Saving & loading of the model.
@@ -231,10 +338,14 @@ if __name__ == '__main__':
     parser.add_argument('--gfs_field_files', type=list,
                         default=[f"/app/Windy/Station/GFS_falconara_param{i}of18_15011500-22042412.npy" for i in
                                  range(18)])
+    parser.add_argument('--val_gfs_files', type=list,
+                        default=[f"/app/Windy/Station/GFS_falconara_param_{i}of10_15011500-22110212_test.npy" for i in
+                                 range(18)])
     parser.add_argument('--target_dir', type=str,
                         default='/app/Windy/Station/')
     parser.add_argument('--train_sampler', type=str, default='RandomSampler')
     parser.add_argument('--num_workers', type=int, default=16)
+    parser.add_argument('--model_type', type=str, default='lstm')
 
     args = parser.parse_args()
-    main(args)
+    test(args)

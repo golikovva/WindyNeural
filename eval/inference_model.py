@@ -1,9 +1,3 @@
-import torch
-import numpy as np
-import torch.nn as nn
-import torchvision.models as models
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset
 from scipy.interpolate import RegularGridInterpolator
 
 import sys
@@ -11,12 +5,12 @@ import sys
 sys.path.insert(0, './')
 
 from libs.standartminmaxscaler import *
-from libs.lstms import *
+from model.models import *
 from libs.trig_math import *
-from libs.stationsdata import *
-
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
 # device = "cpu"
 def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, station_coords=None, lat_bounds=None,
                     lon_bounds=None):
@@ -93,22 +87,23 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         pred = inference_model(gfs_field, stations, './epochs/unilstm_epoch_10.pth', wind_forecast_channels
                                , station_coords, lat_bounds, lon_bounds)
     '''
-    channels_number = gfs_field.shape[1]
+    channels_number = gfs_field.shape[2]
     print(channels_number, 'channels got')
     targetss = MyStandartScaler()
     gfsss = MyStandartScaler()
-    gfsss.channel_fit_transform(gfs_field, channels=[0, 3, 6, 9], channels_dim=1)
+    gfsss.channel_fit_transform(gfs_field, channels=[0, 3, 6, 9], channels_dim=2)
     targetss.channel_fit_transform(station_seq, channels=[0], channels_dim=2)
 
     forecast_range = 6
     sequence_length = 72
     input_size = 512
-    station_params_number = 3
+    station_params_number = 5
+    station_output_size = 3
     gfs_params_number = 14
     hidden_size = 509
     num_layers = 1
 
-    lstm = UnifiedLSTM(input_size, station_params_number, hidden_size, num_layers,
+    lstm = UnifiedLSTM(input_size, station_params_number, station_output_size, hidden_size, num_layers,
                        gfs_params_number, forecast_range, targetss)
     lstm.load_state_dict(torch.load(model_path))
     lstm.to(device)
@@ -117,14 +112,14 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         print('Station or gfs coords are not specified. Assuming station is in the gfs field center...')
         lat_bounds = [0, gfs_field.shape[-1] - 1, gfs_field.shape[-1]]
         lon_bounds = [0, gfs_field.shape[-1] - 1, gfs_field.shape[-1]]
-        station_coord = gfs_field.shape[-1]/2
+        station_coord = gfs_field.shape[-1] / 2
         station_coords = [[station_coord, station_coord] for _ in range(station_seq.shape[0])]
 
     lats = np.linspace(*lat_bounds)
     lons = np.linspace(*lon_bounds)
     lats, lons = lats[35:45], lons[35:45]
     # for wind speed and direction
-    param_linspace = np.linspace(0, 1, 2)
+    param_linspace = np.linspace(0, 2, 3)
     # for each hour of forecast
     time_linspace = np.linspace(0, forecast_range - 1, forecast_range)
     # for each station
@@ -144,15 +139,6 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
     # prepare gfs forecast
     gfs_forecast = gfs_field[:, -6:, wind_forecast_channels, 35:45, 35:45].cpu().detach().numpy()
     # decided to interpolate angle so convert sin/cos to angle
-    gfs_angle = np.arctan2(gfs_forecast[:, :, 1], gfs_forecast[:, :, 2])
-    # unwrap angles
-    for i, batch in enumerate(gfs_angle):
-        for j, hour in enumerate(batch):
-            orig_shape = hour.shape
-            hour = hour.reshape(-1)
-            hour = np.unwrap(hour)
-            gfs_angle[i, j] = hour.reshape(orig_shape)
-    gfs_forecast = np.stack((gfs_forecast[:, :, 0], gfs_angle), axis=2)
     gfs_interpolator = RegularGridInterpolator((stations_linspace, time_linspace, param_linspace, lats, lons),
                                                gfs_forecast)
     gfs_forecast = gfs_interpolator(falconara_points)
@@ -169,14 +155,16 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         # cos(pred) = cos(gfs)cos(corr)-sin(gfs)sin(corr)
         predict[:, j, 2] = corr[:, j, 2] * forecast[:, j, 2] - corr[:, j, 1] * forecast[:, j, 1]
     predict[:, :, 0] = corr[:, :, 0] + forecast[:, :, 0]
+    print(corr[:, :, 0], 'corr')
+    print(forecast[:, :, 0], 'forecast')
     # predict[:, :, 0] = forecast[:, :, 0]
     return predict
 
 
 if __name__ == '__main__':
-    gfs_field = np.load(f"/app/Windy/Station/GFS_falconara_15011500-22042412_14param_test.npy")
+    gfs_field = np.load(f"/app/Windy/Station/GFS_falconara_all_val_channels.npy")
     gfs_field = torch.from_numpy(gfs_field)
-    stations = np.load(f"/app/Windy/Station/4stations_test.npy")
+    stations = np.load(f"/app/Windy/Station/stations4_val.npy")
     stations = torch.from_numpy(stations)
     # gfs_field
     gfs_field = gfs_field[:78]
@@ -190,6 +178,6 @@ if __name__ == '__main__':
     lat_bounds = [33.75, 53.5, 80]
     lon_bounds = [3.5, 23.25, 80]
     wind_forecast_channels = [9, 10, 11]
-    pred = inference_model(gfs_field, stations, './epochs/unilstm_epoch_10.pth', wind_forecast_channels
+    pred = inference_model(gfs_field, stations, './epochs/unilstm_best_epoch_88.pth', wind_forecast_channels
                            , station_coords, lat_bounds, lon_bounds)
     print(pred)
