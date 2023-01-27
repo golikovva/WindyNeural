@@ -1,3 +1,4 @@
+import torch
 from scipy.interpolate import RegularGridInterpolator
 
 import sys
@@ -7,7 +8,7 @@ sys.path.insert(0, './')
 from libs.standartminmaxscaler import *
 from model.models import *
 from libs.trig_math import *
-
+from torch import tensor
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
@@ -19,8 +20,8 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
                             for station 3 values expected: wind speed module, sin(alpha), cos(alpha),
                             where alpha means angle measured in clockwise direction between true north
                             and the direction from which the wind is blowing.
-    '''
-    '''gfs_field - поле значений gfs вокруг станции. размер поля h на w задается из геофизических соображений. Например,
+
+    gfs_field - поле значений gfs вокруг станции. размер поля h на w задается из геофизических соображений. Например,
     для данных ERA5 было выбрано h=w=72, что эквивалентно 72/4=18 градусам - характерный размер мезомасштабных
     процессов. В зависимости от выбранной нейросетевой модели количество необходимых данных может меняться. Например,
     могут нейросети могут быть необходимы данные о скорости ветра, синусе и косинусе его направления на нескольких
@@ -47,7 +48,7 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
     нужно указать wind_forecast_channels = [6, 7, 8] - индексы данных прогноза ветра на высоте 1000gpa
     station_seq - измерение модуля скорости ветра (скаляр) и тригонометрии его направления на станции
     за последние 72 часа
-    
+
     Подразумевается, что данные нескольких станций могут обрабатываться одной моделью.
     Их количество обозначим - station_number
     Нейросети требуются данные ветра со станции и gfs за последние 72 часа. Для разных моделей эта цифра может
@@ -60,7 +61,7 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
                             3 - модуль скорости ветра на станции, sin(alpha), cos(alpha), где alpha - угол,
                             измеренный против часовой стрелки, между направлением
                             на север и направлением откуда дует ветер
-                            
+
     необязательные параметры station_coords, lat_bounds, lon_bounds нужны для интерполяции поля gfs в координату станции
     station_coords - список из координат станций - списков из 2 значений
     lat_bounds - список из 3 значений - южная и северная широты ограничивающие домен gfs и h размер домена по высоте. 
@@ -77,7 +78,7 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         gfs_field = gfs_field[:78]
         gfs_field = torch.stack((gfs_field, gfs_field, gfs_field, gfs_field))
         stations = stations[:, :72]
-    
+
         print(stations.shape)  # torch.Size([4, 72, 3])
         print(gfs_field.shape)  # torch.Size([4, 78, 14, 80, 80])
         station_coords = [[43.61, 13.36], [43.52, 12.73], [43.09, 12.51], [44.02, 12.61]]
@@ -88,14 +89,20 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
                                , station_coords, lat_bounds, lon_bounds)
     '''
     channels_number = gfs_field.shape[2]
-    print(channels_number, 'channels got')
     targetss = MyStandartScaler()
     gfsss = MyStandartScaler()
-    gfsss.channel_fit_transform(gfs_field, channels=[0, 3, 6, 9], channels_dim=2)
-    targetss.channel_fit_transform(station_seq, channels=[0], channels_dim=2)
+    gfsss.channels = [0, 3, 6, 9]
+    gfsss.channel_means = [tensor(23.4362), tensor(14.4138), tensor(9.7638), tensor(4.5854)]
+    gfsss.channel_stddevs = [tensor(12.9463), tensor(8.2695), tensor(5.7451), tensor(3.4172)]
+    targetss.channels = [0]
+    targetss.channels_dim = 2
+    targetss.channel_means = [tensor(2.7047)]
+    targetss.channel_stddevs = [tensor(2.0453)]
+    gfs_field = gfsss.channel_transform(gfs_field, channels_dim=2)
+    station_seq = targetss.channel_transform(station_seq, channels_dim=2)
+
 
     forecast_range = 6
-    sequence_length = 72
     input_size = 512
     station_params_number = 5
     station_output_size = 3
@@ -125,10 +132,10 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
     # for each station
     stations_linspace = np.linspace(0, station_seq.shape[0] - 1, station_seq.shape[0])
 
-    falconara_points = np.ones((station_seq.shape[0], forecast_range, 2, 5))
+    falconara_points = np.ones((station_seq.shape[0], forecast_range, 3, 5))
     for s in range(station_seq.shape[0]):
         for t in range(forecast_range):
-            for p in range(2):
+            for p in range(3):
                 falconara_points[s, t, p] = np.array([s, t, p] + station_coords[s])
     gfs_field = gfs_field.to(device)
     station_seq = station_seq.to(device)
@@ -143,8 +150,6 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
                                                gfs_forecast)
     gfs_forecast = gfs_interpolator(falconara_points)
     # convert back to sin/cos
-    gfs_forecast = np.stack((gfs_forecast[:, :, 0], np.sin(gfs_forecast[:, :, 1]), np.cos(gfs_forecast[:, :, 1])),
-                            axis=2)
     forecast = gfs_forecast
 
     # calculate true sin/cos forecast correction. in case we correct persistence, forecast output is 0h
@@ -155,9 +160,6 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         # cos(pred) = cos(gfs)cos(corr)-sin(gfs)sin(corr)
         predict[:, j, 2] = corr[:, j, 2] * forecast[:, j, 2] - corr[:, j, 1] * forecast[:, j, 1]
     predict[:, :, 0] = corr[:, :, 0] + forecast[:, :, 0]
-    print(corr[:, :, 0], 'corr')
-    print(forecast[:, :, 0], 'forecast')
-    # predict[:, :, 0] = forecast[:, :, 0]
     return predict
 
 
