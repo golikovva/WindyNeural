@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 # from libs import mytransforms
 from libs.standartminmaxscaler import *
-from model.models import UnifiedLSTM
+from model.models import WeatherLSTM
 from libs.mydatasets import WindDataset
 from config.stationsdata import stations_data
 from libs.trig_math import proj_to_trig
@@ -26,13 +26,13 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def test(args):
     cfg = Config.fromfile(args.config_file)
-    dataset = MPWindDataset(args.val_gfs_files, args.target_dir, args.sequence_length,
+    dataset = MPWindDataset(args.val_gfs_files, args.gfs_forecast_files, args.target_dir, args.sequence_length,
                             args.forecast_range, args.batch_size,
                             test_mode=True)
     test_steps = len(dataset) // args.batch_size + 1
     batches_queue_length = min(test_steps, 16)
-    model = build_model(args.model_type, cfg.model, station_scaler=dataset.targetss)
-    state_dict = torch.load('./epochs/unilstm_best_epoch_88.pth')
+    model = build_model(args.model_type, cfg.model)
+    state_dict = torch.load('./epochs_transformer/transformer_epoch_106.pth')
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -61,7 +61,7 @@ def test(args):
         for batch_idx in tqdm(range(test_steps), total=test_steps):
             gfs_seq, station_seq, target, true_forecast = val_cuda_batches_queue.get(block=True)
             y = model(gfs_seq, station_seq)
-            target = dataset.targetss.channel_inverse_transform(target, channels_dim=2)
+            # target = dataset.targetss.channel_inverse_transform(target, channels_dim=2)
             # target = dataset.targetss.channel_inverse_transform(target, 2)
             loss = criterion(y, true_forecast)
             val_loss_avg += loss.item()
@@ -69,8 +69,11 @@ def test(args):
             interpolator = dataset.interpolators[0]
             xidx = interpolator.idxx
             yidx = interpolator.idxy
-            gfs_seq = dataset.gfsss.channel_inverse_transform(gfs_seq, channels_dim=2)
-
+            # print(gfs_seq.shape, 'gfs_Seq shape before inverse transform')
+            # print(gfs_seq.min(), gfs_seq.max(), 'min max before transform')
+            print(gfs_seq.shape)
+            gfs_seq = dataset.gfsmm.channel_inverse_transform(gfs_seq, channels_dim=2)
+            # print(gfs_seq.min(), gfs_seq.max(), 'min max after transform')
             forecast = gfs_seq[:, -6:, dataset.ground_wind, xidx:xidx+2, yidx:yidx+2]
             forecast = dataset.interpolators[0].interpolate(forecast)
 
@@ -85,19 +88,20 @@ def test(args):
             gfs_forecast_stat.append((forecast[:, :, 0].cpu().detach()))
             target_stat.append(target[:, :, 0].cpu().detach())
 
-            show_images = False
+            show_images = True
             if show_images:
-                plt.figure(figsize=(4, 3), dpi=100)
-                plt.plot(predict[:, 5, 0].cpu().detach(), label='pred Data')  # actual plot
-                plt.plot(forecast[:, 5, 0].cpu().detach(), label='gfs forecast')  # actual plot
-                plt.plot(target[:, 5, 0].cpu().detach(), label='target Data')  # predicted plot
-                plt.plot(y[:, 5, 0].cpu().detach(), label='corr')
-                plt.title('Time-Series Prediction')
-                plt.legend()
-                # plt.show()
-                plt.savefig(f'result_5h_{batch_idx}idx')
+                for h in range(6):
+                    plt.figure(figsize=(4, 3), dpi=300)
+                    plt.plot(predict[:, h, 0].cpu().detach(), label='pred Data')  # actual plot
+                    plt.plot(forecast[:, h, 0].cpu().detach(), label='gfs forecast')  # actual plot
+                    plt.plot(target[:, h, 0].cpu().detach(), label='target Data')  # predicted plot
+                    plt.plot(y[:, h, 0].cpu().detach(), label='corr')
+                    plt.title('Time-Series Prediction')
+                    plt.legend()
+                    # plt.show()
+                    plt.savefig(f'images/result_{h}h_{batch_idx}idx')
                 batch_idx += 1
-                if batch_idx > 5:
+                if batch_idx > 15:
                     break
 
         avg_loss = val_loss_avg / test_steps
@@ -129,155 +133,6 @@ def test(args):
             except Empty:
                 pass
         return losses_dict
-
-
-def main(args):
-    print(os.path.abspath(__file__))
-    gfs_files = [f"/app/Windy/Station/GFS_falconara_param{i}of18_15011500-22042412.npy" for i in range(18)]
-    station_dir = '/app/Windy/Station/'
-    gfs_field = []
-    for pressure_level in tqdm([0, 1, 2, 7], total=4):
-        gfs = []
-        for wind_dir in range(2):
-            gfs.append(np.load(gfs_files[pressure_level * 2 + wind_dir]).astype(np.float32))
-        gfs_field.append(np.stack(proj_to_trig(gfs[0], gfs[1]), axis=1))
-    for other_params in tqdm([16, 17], total=2):
-        gfs_field.append(np.expand_dims(
-            np.load(gfs_files[other_params]).astype(np.float32), axis=1))
-    ground_wind = [9, 10, 11]
-    gfs_field = np.concatenate(gfs_field, axis=1)
-    gfs_field = torch.from_numpy(gfs_field)
-    channels_number = gfs_field.shape[1]
-    print(channels_number, 'channels')
-
-    stations_list = []
-    keys_list = []
-    for key in tqdm(stations_data, total=len(stations_data)):
-        if key == 'falconara':
-            stations_list.append(np.load(os.path.join(station_dir, stations_data[key]['filename'])))
-            keys_list.append(key)
-    stations = np.stack(stations_list, axis=0)
-    stations = np.squeeze(stations)
-    stations = torch.from_numpy(stations)
-    print(stations.shape, 'stations.shape')
-    print(gfs_field.shape, 'gfs.shape')
-    print(stations[:12], 'station')
-    print(gfs_field[1], 'gfs')
-    targetss = MyStandartScaler()
-    gfsss = MyStandartScaler()
-    gfsss.channel_fit_transform(gfs_field, channels=[0, 3, 6, 9], channels_dim=1)
-    targetss.channel_fit_transform(stations, channels=[0], channels_dim=1)
-    print(stations[:12], 'station 1')
-    print(gfs_field[1], 'gfs 1')
-    test_data = gfs_field[60000:, :]
-    test_target = stations[60000:, :]
-    data = gfs_field[:60000, :]
-    target = stations[:60000, :]
-    forecast_range = 6
-
-    lstm = UnifiedLSTM(args.input_size, args.station_params_number, args.hidden_size, args.num_layers,
-                       14, args.forecast_range, targetss)
-    lstm.load_state_dict(torch.load('./epochs/unilstm_epoch_10.pth'))
-    lstm.eval()
-    lstm.to(device)
-
-    test_dataset = WindDataset(test_data, test_target, 72, forecast_range, device)
-    batch_size = args.batch_size
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    lats = np.linspace(33.75, 53.5, 80)
-    lons = np.linspace(3.5, 23.25, 80)
-    lats, lons = lats[39:41], lons[39:41]
-    # for wind speed and direction
-    param_linspace = np.linspace(0, 1, 2)
-    # for each hour of forecast
-    time_linspace = np.linspace(0, forecast_range - 1, forecast_range)
-    # for each item in batch
-    batch_linspace = np.linspace(0, batch_size - 1, batch_size)
-
-    falconara_coord = [43.61, 13.36]
-    falconara_points = np.ones((batch_size, forecast_range, 2, 5))
-    for b in range(batch_size):
-        for t in range(forecast_range):
-            for p in range(2):
-                falconara_points[b, t, p] = np.array([b, t, p] + falconara_coord)
-
-    lstm.eval()
-    eval_loss_avg = []
-    print('Evaluating ...')
-    plt.figure(figsize=(8, 6), dpi=300)
-    forecast_stat = []
-    target_stat = []
-    k = 0
-    for era_data, station_data, target in test_dataloader:
-
-        corr = lstm(era_data, station_data)
-        corr = corr.cpu().detach().numpy()
-        print(era_data.shape, 'eradata shape before transform')
-        print(target.shape, 'tagret shape before transform')
-        era_data = gfsss.channel_inverse_transform(era_data, 2).cpu().detach().numpy()
-        target = targetss.channel_inverse_transform(target, 2).cpu().detach()
-
-        # prepare gfs forecast
-        gfs_forecast = era_data[:, -6:, ground_wind, 39:41, 39:41]
-        print(gfs_forecast[1], 'gfs in loop')
-        print(target[:, 1, 0], 'target in loop')
-        # decided to interpolate angle so convert sin/cos to angle
-        gfs_angle = np.arctan2(gfs_forecast[:, :, 1], gfs_forecast[:, :, 2])
-        # unwrap angles
-        for i, batch in enumerate(gfs_angle):
-            for j, hour in enumerate(batch):
-                orig_shape = hour.shape
-                hour = hour.reshape(-1)
-                hour = np.unwrap(hour)
-                gfs_angle[i, j] = hour.reshape(orig_shape)
-        gfs_forecast = np.stack((gfs_forecast[:, :, 0], gfs_angle), axis=2)
-        GFS_interpolator = RegularGridInterpolator((batch_linspace, time_linspace, param_linspace, lats, lons),
-                                                   gfs_forecast)
-        gfs_forecast = GFS_interpolator(falconara_points)
-        # convert back to sin/cos
-        gfs_forecast = np.stack((gfs_forecast[:, :, 0], np.sin(gfs_forecast[:, :, 1]), np.cos(gfs_forecast[:, :, 1])),
-                                axis=2)
-        forecast = gfs_forecast
-        print(forecast.shape, 'forecast shape')
-
-        # calculate true sin/cos forecast correction. if we correct persistence, forecast output is 0h
-        predict = np.zeros_like(corr)
-        for j in range(6):
-            # sin(pred) = cos(corr)sin(gfs)+cos(gfs)sin(corr)
-            predict[:, j, 1] = forecast[:, j, 1] * corr[:, j, 2] + forecast[:, j, 2] * corr[:, j, 1]
-            # cos(pred) = cos(gfs)cos(corr)-sin(gfs)sin(corr)
-            predict[:, j, 2] = corr[:, j, 2] * forecast[:, j, 2] - corr[:, j, 1] * forecast[:, j, 1]
-        # predict[:, :, 0] = corr[:, :, 0] + forecast[:, :, 0]
-        predict[:, :, 0] = forecast[:, :, 0]
-        print(corr[:50, :, 0])
-
-        forecast_stat.append(predict[:, :, 0])
-        target_stat.append(target[:, :, 0])
-        #
-        plt.figure(figsize=(4, 3), dpi=100)
-        plt.plot(predict[:, 5, 0], label='pred Data')  # actual plot
-        plt.plot(target[:, 5, 0], label='target Data')  # predicted plot
-        plt.plot(corr[:, 5, 0], label='corr')
-        #     print(target[:, 5, 2], pred[:, 5, 0])
-        plt.title('Time-Series Prediction')
-        plt.legend()
-        # plt.show()
-        plt.savefig(f'result_5h_{k}idx')
-        k += 1
-        if k > 5:
-            break
-
-    forecast = np.concatenate(forecast_stat, 0)
-    target = np.concatenate(target_stat, 0)
-    # print(forecast[:60, 5], target[:60, 5])
-    calc_wRMSE(forecast, target)
-    forecast = np.concatenate(forecast_stat, 0)
-    target = np.concatenate(target_stat, 0)
-    calc_cat_change_metric(forecast, target)
-    # forecast = torch.cat(forecast_stat, 0)
-    # target = torch.cat(target_stat, 0)
-
 
 
 if __name__ == '__main__':
@@ -338,13 +193,16 @@ if __name__ == '__main__':
     parser.add_argument('--gfs_field_files', type=list,
                         default=[f"/app/Windy/Station/GFS_falconara_param{i}of18_15011500-22042412.npy" for i in
                                  range(18)])
+    parser.add_argument('--gfs_forecast_files', type=list,
+                        default=[f"/app/Windy/Station/GFS_falconara_param{i}of18_15011500-22042412_006.npy" for i in
+                                 range(18)])
     parser.add_argument('--val_gfs_files', type=list,
                         default=[f"/app/Windy/Station/GFS_falconara_param_{i}of10_15011500-22110212_test.npy" for i in
                                  range(18)])
     parser.add_argument('--target_dir', type=str,
                         default='/app/Windy/Station/')
     parser.add_argument('--train_sampler', type=str, default='RandomSampler')
-    parser.add_argument('--num_workers', type=int, default=16)
+    parser.add_argument('--num_workers', type=int, default=1)
     parser.add_argument('--model_type', type=str, default='lstm')
 
     args = parser.parse_args()

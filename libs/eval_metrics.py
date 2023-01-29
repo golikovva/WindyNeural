@@ -26,7 +26,7 @@ def calc_wRMSE(y_pred, y_true):
     weight_speed_vector(y_pred, y_true)
     weight_speed_vector(y_true, y_true)
     wRMSE = np.sqrt((np.square(y_pred - y_true)).mean(axis=0))
-    print("LSTM RMSE_weighted +1/+6h:", wRMSE)
+    print("RMSE_weighted +1/+6h:", wRMSE)
 
 
 def speed_to_category(speed):
@@ -53,4 +53,4 @@ def calc_cat_change_metric(y_pred, y_true):
     speed_to_category(y_true)
     category_to_delta_category(y_pred)
     category_to_delta_category(y_true)
-    print("LSTM category_change_metric +1/+6h:", category_metric(y_true, y_pred))
+    print("category_change_metric +1/+6h:", category_metric(y_true, y_pred))

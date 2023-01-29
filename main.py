@@ -1,6 +1,7 @@
 import argparse
 import os
-
+import random
+import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
 
@@ -16,7 +17,6 @@ from config.stationsdata import stations_data
 from libs.trig_math import proj_to_trig
 from libs.interpolatation import *
 from model.build_model import *
-from model.models import UnifiedLSTM
 from config.config import Config
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -24,6 +24,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class thread_killer(object):
     """Boolean object for signaling a worker thread to terminate"""
+
     def __init__(self):
         self.to_kill = False
 
@@ -84,27 +85,38 @@ def get_objects_i(objects_count):
     """
     current_objects_id = 0
     while True:
-        yield randint(0, objects_count)
-
+        # yield randint(0, objects_count)
+        yield current_objects_id
+        current_objects_id = (current_objects_id + 1) % objects_count
 
 class MPWindDataset(Dataset):
-    def __init__(self, gfs_files, station_dir, sequence_length, forecast_range, batch_size=64,
+    def __init__(self, gfs_files, gfs_forecast_files, station_dir, sequence_length, forecast_range, batch_size=64,
                  station_transform=None, gfs_transform=None, test_mode=False, train=True):
-        print('Init called!')
+        print('Initializing MPWindDataset!...')
         gfs_field = []
+        # gfs_forecast_field = []
         # 4 isobaric height levels - 250, 500, 750, 1000 gpa
+        print('Loading GFS wind speed data...')
         for pressure_level in tqdm([0, 1, 2, 3], total=4):
             gfs = []
+            # gfs_forecast = []
             for wind_dir in range(2):
-                gfs.append(np.load(gfs_files[pressure_level * 2 + wind_dir]).astype(np.float32))
+                gfs.append(np.load(gfs_files[pressure_level * 2 + wind_dir], mmap_mode='r').astype(np.float32))
+                # gfs_forecast.append(np.load(gfs_forecast_files[pressure_level * 2 + wind_dir], mmap_mode='r').astype(np.float32))
             gfs_field.append(np.stack(proj_to_trig(gfs[0], gfs[1]), axis=1))
-
+            # gfs_forecast_field.append(np.stack(proj_to_trig(gfs_forecast[0], gfs_forecast[1]), axis=1))
+        print('Loading other GFS data...')
         for other_params in tqdm([8, 9], total=2):
             gfs_field.append(np.expand_dims(
                 np.load(gfs_files[other_params]).astype(np.float32), axis=1))
+            # gfs_forecast_field.append(np.expand_dims(
+            #     np.load(gfs_forecast_files[other_params]).astype(np.float32), axis=1))
         self.ground_wind = [9, 10, 11]
         gfs_field = np.concatenate(gfs_field, axis=1)
         gfs_field = torch.from_numpy(gfs_field)
+
+        # gfs_forecast_field = np.concatenate(gfs_forecast_field, axis=1)
+        # gfs_forecast_field = torch.from_numpy(gfs_forecast_field)
         self.channels_number = gfs_field.shape[1]
         print(self.channels_number, 'channels')
 
@@ -114,7 +126,9 @@ class MPWindDataset(Dataset):
         self.x = np.linspace(33.75, 53.5, 80)
         self.y = np.linspace(3.5, 23.25, 80)
         filename = 'val_file' if test_mode else 'filename'
+        print('Loading stations data...')
         for key in tqdm(stations_data, total=len(stations_data)):
+            print(stations_data[key][filename])
             stations_list.append(np.load(os.path.join(station_dir, stations_data[key][filename])))
             interpolator = Interpolator(self.x, self.y)
             interpolator.get_bilinear_weights(stations_data[key]['coord'])
@@ -122,15 +136,22 @@ class MPWindDataset(Dataset):
             self.keys_list.append(key)
         stations = np.stack(stations_list, axis=0)
         stations = torch.from_numpy(stations)
+        stations = stations.type(torch.float)
+        gfs_field = gfs_field.type(torch.float)
+
+        # gfs_forecast_field = gfs_forecast_field.type(torch.float)
         self.test_mode = test_mode
 
-        self.targetss = MyStandartScaler()
-        self.gfsss = MyStandartScaler()
-        self.gfsss.channel_fit(gfs_field, channels=[0, 3, 6, 9], channels_dim=1)
-        self.targetss.channel_fit(stations, channels=[0], channels_dim=1)
-
+        self.targetmm = MyMinMaxScaler()
+        self.gfsmm = MyMinMaxScaler()
+        print(gfs_field.shape, stations.shape)
+        self.gfsmm.channel_fit(gfs_field, channels_dim=1)
+        self.targetmm.channel_fit(stations, channels_dim=2)
+        print(self.targetmm.channel_mins, self.targetmm.channel_maxs)
+        print(self.gfsmm.channel_mins, self.gfsmm.channel_maxs)
         self.stations = stations
         self.gfs_field = gfs_field
+        # self.gfs_forecast_field = gfs_forecast_field
         self.sequence_length = sequence_length
         self.forecast_range = forecast_range
         self.gfs_transform = gfs_transform
@@ -144,6 +165,8 @@ class MPWindDataset(Dataset):
         self.yield_lock = threading.Lock()  # mutex for generator yielding of batch
         self.init_count = 0
         self.interpolator_linspace = self.get_interpolation_linspace()
+        print("INIT COMPLETED!")
+        print(self.gfs_field.shape, self.stations.shape)
 
     def get_interpolation_linspace(self):
         lats = np.linspace(33.75, 53.5, 80)
@@ -164,26 +187,29 @@ class MPWindDataset(Dataset):
     def __iter__(self):
         while True:
             with self.lock:
-                gfs_seqs = []
-                station_seqs = []
-                forecasts = []
+                if self.init_count == 0:
+                    gfs_seqs = []
+                    station_seqs = []
+                    forecasts = []
+                    self.init_count = 1
             for idx in self.objects_id_generator:
+                # 1) get data
                 gfs_seq = self.gfs_field[idx:idx + self.sequence_length + self.forecast_range].clone()
-                # print(self.gfs_field.shape, gfs_seq.shape)
+                # gfs_seq = self.gfs_field[idx:idx + self.sequence_length].clone()
+                # fc = self.gfs_forecast_field[idx + self.sequence_length:idx + self.sequence_length + self.forecast_range].clone()
+                # gfs_seq = torch.cat((gfs_seq, fc), dim=0)
                 st_id = randint(0, len(stations_data) - 1)
                 station_seq = self.stations[st_id, idx:idx + self.sequence_length + self.forecast_range].clone()
                 interpolator = self.interpolators[st_id]
-                if self.station_transform:
-                    station_seq[:-self.forecast_range] = self.station_transform(station_seq[:-self.forecast_range])
-                if self.gfs_transform:
-                    gfs_seq = self.gfs_transform(gfs_seq)
+                # 1.1) get gfs forecast in coord of station
                 gfs_forecast = gfs_seq[-6:, self.ground_wind,
                                        interpolator.idxx:interpolator.idxx + 2,
                                        interpolator.idxy:interpolator.idxx + 2]
                 gfs_forecast = interpolator.interpolate(gfs_forecast)
-
+                # 1.2) calculate true correction of interpolated gfs
                 true_corr = torch.zeros_like(gfs_forecast, device=torch.device(device))
                 # sin(true_corr) = sin(6h)cos(0h)-cos(6h)sin(0h)
+                # print(true_corr.shape, station_seq.shape, gfs_forecast.shape)
                 true_corr[:, 1] = station_seq[-self.forecast_range:, 1] * gfs_forecast[:, 2] - station_seq[
                                                                                                -self.forecast_range:,
                                                                                                2] * gfs_forecast[:, 1]
@@ -192,8 +218,14 @@ class MPWindDataset(Dataset):
                                                                                                -self.forecast_range:,
                                                                                                1] * gfs_forecast[:, 1]
                 true_corr[:, 0] = station_seq[-self.forecast_range:, 0] - gfs_forecast[:, 0]
-                gfs_seq = self.gfsss.channel_transform(gfs_seq, 1)
-                station_seq = self.targetss.channel_transform(station_seq, 1)
+                # 2) scale data to [0, 1]
+                gfs_seq = self.gfsmm.channel_transform(gfs_seq, 1)
+                station_seq = self.targetmm.channel_transform(station_seq, 1)
+                # 3) augment data
+                if self.station_transform:
+                    station_seq[:-self.forecast_range] = self.station_transform(station_seq[:-self.forecast_range])
+                if self.gfs_transform:
+                    gfs_seq = self.gfs_transform(gfs_seq)
                 # Concurrent access by multiple threads to the lists below
                 with self.yield_lock:
                     if (len(gfs_seqs)) < self.batch_size:
@@ -207,7 +239,9 @@ class MPWindDataset(Dataset):
                         yield gfs_batch_tensor, station_batch_tensor, forecast_batch_tensor
 
                         gfs_seqs, station_seqs, forecasts = [], [], []
-
+            with self.lock:
+                # random.shuffle(self.dicts)
+                self.init_count = 0
 
 def train_epoch(lstm: nn.Module,
                 optimizer: torch.optim.Optimizer,
@@ -273,19 +307,22 @@ def main(args):
     cfg = Config.fromfile(args.config_file)
     print(cfg)
     station_augmentation = [
-        transforms.RandomApply([mytransforms.StationNormalNoize(0, 0.2), ], p=1),
+        transforms.RandomApply([mytransforms.StationNormalNoize(0, 0.07), ], p=0.3),
     ]
-    gfs_augmentation = [
-        # transforms.RandomApply([transforms.RandomRotation(3)], p=0.2),
-        transforms.RandomApply([transforms.GaussianBlur(3)], p=0.2),
-    ]
+    gfs_augmentation = torch.nn.Sequential(
+        mytransforms.GFSRandomPosterize(6, 0.05),
+        transforms.RandomApply(torch.nn.ModuleList([mytransforms.GFSNormalNoize(mean=0, std=0.04)]), p=0.2),
+        mytransforms.GFSAffine(degrees=3, p=0.1),
+        mytransforms.ChannelRandomErasing(p=0.07)
+    )
+
     station_augmentation = transforms.Compose(station_augmentation)
     gfs_augmentation = transforms.Compose(gfs_augmentation)
 
-    dataset = MPWindDataset(args.gfs_field_files, args.target_dir, args.sequence_length,
+    dataset = MPWindDataset(args.gfs_field_files, args.gfs_forecast_files, args.target_dir, args.sequence_length,
                             args.forecast_range, args.batch_size, station_augmentation, gfs_augmentation,
                             test_mode=False)
-    val_ds = MPWindDataset(args.val_gfs_files, args.target_dir, args.sequence_length,
+    val_ds = MPWindDataset(args.val_gfs_files, args.val_gfs_forecast_files, args.target_dir, args.sequence_length,
                            args.forecast_range, args.batch_size,
                            test_mode=True)
     steps_per_epoch = len(dataset) // args.batch_size + 1
@@ -293,7 +330,8 @@ def main(args):
     batches_queue_length = min(steps_per_epoch, 16)
 
     print('creating the model')
-    model = build_model(args.model_type, cfg.model, station_scaler=dataset.targetss)
+
+    model = build_model(args.model_type, cfg.model)
     model.to(device)
     print('lstm created')
     # if args.start_epoch != 1:
@@ -305,7 +343,10 @@ def main(args):
     criterion = torch.nn.MSELoss()  # mean-squared error for regression
     criterion.cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.exp_gamma)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=10e-7,
+                                                                     last_epoch=-1)
+
+    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=args.exp_gamma)
 
     train_batches_queue = Queue(maxsize=batches_queue_length)
     train_cuda_batches_queue = Queue(maxsize=batches_queue_length)
@@ -353,15 +394,16 @@ def main(args):
 
         avg_train_loss.append(train_losses['avg_loss'])
         avg_val_loss.append(val_losses['avg_loss'])
-        with open('train.txt', 'a') as f:
+        with open('transformer/train.txt', 'a') as f:
             f.write(str(epoch) + ' ' + str(avg_train_loss[-1]) + '\n')
-        with open('val.txt', 'a') as f:
+        with open('transformer/val.txt', 'a') as f:
             f.write(str(epoch) + ' ' + str(avg_val_loss[-1]) + '\n')
-        torch.save(model.state_dict(), 'epochs/unilstm_epoch_%d.pth' % epoch)
+        torch.save(model.state_dict(), 'epochs_transformer/transformer_epoch_%d.pth' % epoch)
         if avg_val_loss[-1] == min(avg_val_loss):
-            torch.save(model.state_dict(), 'epochs/unilstm_best_epoch_%d.pth' % epoch)
-        np.save('train_loss', np.array(avg_train_loss))
-        np.save('val_loss', np.array(avg_val_loss))
+            torch.save(model.state_dict(), 'epochs_transformer/transformer_best_epoch_%d.pth' % epoch)
+        np.save('transformer/train_loss', np.array(avg_train_loss))
+        np.save('transformer/val_loss', np.array(avg_val_loss))
+        np.save('transformer/lr', scheduler.get_last_lr())
         print(scheduler.get_last_lr(), '- current learning rate')
         scheduler.step()
 
@@ -393,7 +435,7 @@ if __name__ == '__main__':
     Saving & loading of the model.
     '''
     parser.add_argument('--save_dir', type=str, default='./models')
-    parser.add_argument('--save_name', type=str, default='unified_lstm')
+    parser.add_argument('--save_name', type=str, default='transformer')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--load_path', type=str, default=None)
     parser.add_argument('--overwrite', action='store_false')
@@ -402,25 +444,24 @@ if __name__ == '__main__':
     Training Configuration of FixMatch
     '''
 
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=149)
     parser.add_argument('--start_epoch', type=int, default=0)
-    parser.add_argument('--num_train_iter', type=int, default=20,
-                        help='total number of training iterations')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='total number of batch size of labeled data')
 
     '''
     Optimizer configurations
     '''
-    parser.add_argument('--lr', type=float, default=0.05)
+    parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--exp_gamma', type=float, default=0.955)
 
-
     '''
     Backbone Net Configurations
     '''
+
+    # parser.add_argument('--fea_model_type', type=str, default='ResNet-18')
     parser.add_argument('--model_type', type=str, default='lstm')
     parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--forecast_range', type=int, default=6)
@@ -434,16 +475,23 @@ if __name__ == '__main__':
     parser.add_argument('--sequence_length', type=int, default=72)
     parser.add_argument('--gfs_field_files', type=list,
                         default=[f"/app/Windy/Station/GFS_falconara_param_{i}of10_15011500-22110212_train.npy" for i in
-                                 range(18)])
+                                 range(10)])
+    parser.add_argument('--gfs_forecast_files', type=list,
+                        default=[f"/app/Windy/Station/GFS_falconara_param_{i}of10_15011500-22110212_f006_train.npy" for i in
+                                 range(10)])
     parser.add_argument('--target_dir', type=str,
                         default='/app/Windy/Station/')
     parser.add_argument('--val_gfs_files', type=list,
                         default=[f"/app/Windy/Station/GFS_falconara_param_{i}of10_15011500-22110212_val.npy" for i in
                                  range(18)])
+    parser.add_argument('--val_gfs_forecast_files', type=list,
+                        default=[f"/app/Windy/Station/GFS_falconara_param_{i}of10_15011500-22110212_f006_val.npy" for i
+                                 in
+                                 range(10)])
     parser.add_argument('--val_target_dir', type=str,
                         default='/app/Windy/Station/')
     parser.add_argument('--train_sampler', type=str, default='RandomSampler')
-    parser.add_argument('--num_workers', type=int, default=16)
+    parser.add_argument('--num_workers', type=int, default=4)
 
     args = parser.parse_args()
     main(args)

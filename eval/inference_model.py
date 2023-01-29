@@ -1,4 +1,5 @@
 from scipy.interpolate import RegularGridInterpolator
+from addict import Dict
 
 import sys
 
@@ -7,20 +8,23 @@ sys.path.insert(0, './')
 from libs.standartminmaxscaler import *
 from model.models import *
 from libs.trig_math import *
-
+from model.build_model import *
+from model.wrn import *
+from config.config import Config
+from torch import tensor
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 # device = "cpu"
-def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, station_coords=None, lat_bounds=None,
+def inference_model(gfs_field1, station_seq, model_path, wind_forecast_channels1, station_coords=None, lat_bounds=None,
                     lon_bounds=None):
     '''data required shape: gfs - station_number x sequence_length+forecast_range x channels number x h x w
                             station - station_number x sequence_length x 3
                             for station 3 values expected: wind speed module, sin(alpha), cos(alpha),
                             where alpha means angle measured in clockwise direction between true north
                             and the direction from which the wind is blowing.
-    '''
-    '''gfs_field - поле значений gfs вокруг станции. размер поля h на w задается из геофизических соображений. Например,
+
+    gfs_field - поле значений gfs вокруг станции. размер поля h на w задается из геофизических соображений. Например,
     для данных ERA5 было выбрано h=w=72, что эквивалентно 72/4=18 градусам - характерный размер мезомасштабных
     процессов. В зависимости от выбранной нейросетевой модели количество необходимых данных может меняться. Например,
     могут нейросети могут быть необходимы данные о скорости ветра, синусе и косинусе его направления на нескольких
@@ -87,32 +91,12 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
         pred = inference_model(gfs_field, stations, './epochs/unilstm_epoch_10.pth', wind_forecast_channels
                                , station_coords, lat_bounds, lon_bounds)
     '''
-    channels_number = gfs_field.shape[2]
-    print(channels_number, 'channels got')
-    targetss = MyStandartScaler()
-    gfsss = MyStandartScaler()
-    gfsss.channel_fit_transform(gfs_field, channels=[0, 3, 6, 9], channels_dim=2)
-    targetss.channel_fit_transform(station_seq, channels=[0], channels_dim=2)
-
     forecast_range = 6
-    sequence_length = 72
-    input_size = 512
-    station_params_number = 5
-    station_output_size = 3
-    gfs_params_number = 14
-    hidden_size = 509
-    num_layers = 1
-
-    lstm = UnifiedLSTM(input_size, station_params_number, station_output_size, hidden_size, num_layers,
-                       gfs_params_number, forecast_range, targetss)
-    lstm.load_state_dict(torch.load(model_path))
-    lstm.to(device)
-    lstm.eval()
     if not lat_bounds or not lon_bounds or not station_coords:
         print('Station or gfs coords are not specified. Assuming station is in the gfs field center...')
-        lat_bounds = [0, gfs_field.shape[-1] - 1, gfs_field.shape[-1]]
-        lon_bounds = [0, gfs_field.shape[-1] - 1, gfs_field.shape[-1]]
-        station_coord = gfs_field.shape[-1] / 2
+        lat_bounds = [0, gfs_field1.shape[-1] - 1, gfs_field1.shape[-1]]
+        lon_bounds = [0, gfs_field1.shape[-1] - 1, gfs_field1.shape[-1]]
+        station_coord = gfs_field1.shape[-1] / 2
         station_coords = [[station_coord, station_coord] for _ in range(station_seq.shape[0])]
 
     lats = np.linspace(*lat_bounds)
@@ -125,39 +109,54 @@ def inference_model(gfs_field, station_seq, model_path, wind_forecast_channels, 
     # for each station
     stations_linspace = np.linspace(0, station_seq.shape[0] - 1, station_seq.shape[0])
 
-    falconara_points = np.ones((station_seq.shape[0], forecast_range, 2, 5))
+    falconara_points = np.ones((station_seq.shape[0], forecast_range, 3, 5))*(-100)
     for s in range(station_seq.shape[0]):
         for t in range(forecast_range):
-            for p in range(2):
+            for p in range(3):
                 falconara_points[s, t, p] = np.array([s, t, p] + station_coords[s])
-    gfs_field = gfs_field.to(device)
-    station_seq = station_seq.to(device)
-    corr = lstm(gfs_field, station_seq)
-    corr = corr.cpu().detach().numpy()
-    gfs_field = gfsss.channel_inverse_transform(gfs_field, 2)
 
     # prepare gfs forecast
-    gfs_forecast = gfs_field[:, -6:, wind_forecast_channels, 35:45, 35:45].cpu().detach().numpy()
+    gfs_forecast = gfs_field1[:, -6:, wind_forecast_channels1, 35:45, 35:45].cpu().detach().numpy()
     # decided to interpolate angle so convert sin/cos to angle
     gfs_interpolator = RegularGridInterpolator((stations_linspace, time_linspace, param_linspace, lats, lons),
                                                gfs_forecast)
     gfs_forecast = gfs_interpolator(falconara_points)
     # convert back to sin/cos
-    gfs_forecast = np.stack((gfs_forecast[:, :, 0], np.sin(gfs_forecast[:, :, 1]), np.cos(gfs_forecast[:, :, 1])),
-                            axis=2)
     forecast = gfs_forecast
+    # print(gfs_field[0, :6, [9,10,11],39:41, 39:41], 'before transform')
+    targetmm = MyMinMaxScaler()
+    gfsmm = MyMinMaxScaler()
+    gfsmm.channel_mins = [tensor(0.0032), tensor(-1.), tensor(-1.), tensor(0.0026), tensor(-1.), tensor(-1.),
+                          tensor(0.0014), tensor(-1.), tensor(-1.), tensor(0.0004), tensor(-1.), tensor(-1.),
+                          tensor(99061.1094), tensor(264.8655)]
+    gfsmm.channel_maxs = [tensor(71.7118), tensor(1.), tensor(1.), tensor(49.8969), tensor(1.), tensor(1.),
+                          tensor(38.2579), tensor(1.), tensor(1.), tensor(32.0558), tensor(1.), tensor(1.),
+                          tensor(103424.6484), tensor(320.6323)]
+    targetmm.channel_mins = [tensor(0.), tensor(-1.), tensor(-1.), tensor(0.3379), tensor(0.)]
+    targetmm.channel_maxs = [tensor(13.9000), tensor(1.), tensor(1.), tensor(0.8379), tensor(1.)]
+    gfs_field1 = gfsmm.channel_transform(gfs_field1, channels_dim=2)
+    station_seq = targetmm.channel_transform(station_seq, channels_dim=2)
+    cfg = Config.fromfile("./config/inference_config.py")
 
+    model = build_model('lstm', cfg.model)
+    state_dict = torch.load(model_path)
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    gfs_field1 = gfs_field1.to(device)
+    station_seq = station_seq.to(device)
+    corr = model(gfs_field1, station_seq)
+    corr = corr.cpu().detach().numpy()
     # calculate true sin/cos forecast correction. in case we correct persistence, forecast output is 0h
     predict = np.zeros_like(corr)
-    for j in range(6):
-        # sin(pred) = cos(corr)sin(gfs)+cos(gfs)sin(corr)
-        predict[:, j, 1] = forecast[:, j, 1] * corr[:, j, 2] + forecast[:, j, 2] * corr[:, j, 1]
-        # cos(pred) = cos(gfs)cos(corr)-sin(gfs)sin(corr)
-        predict[:, j, 2] = corr[:, j, 2] * forecast[:, j, 2] - corr[:, j, 1] * forecast[:, j, 1]
-    predict[:, :, 0] = corr[:, :, 0] + forecast[:, :, 0]
-    print(corr[:, :, 0], 'corr')
-    print(forecast[:, :, 0], 'forecast')
+    # sin(pred) = cos(corr)sin(gfs)+cos(gfs)sin(corr)
+    predict[:, :, 1] = forecast[:, :, 1] * corr[:, :, 2] + forecast[:, :, 2] * corr[:, :, 1]
+    # cos(pred) = cos(gfs)cos(corr)-sin(gfs)sin(corr)
+    predict[:, :, 2] = corr[:, :, 2] * forecast[:, :, 2] - corr[:, :, 1] * forecast[:, :, 1]
+    predict[:, :, 0] = np.clip(corr[:, :, 0] + forecast[:, :, 0], a_min=0, a_max=None)
     # predict[:, :, 0] = forecast[:, :, 0]
+
     return predict
 
 
@@ -167,10 +166,10 @@ if __name__ == '__main__':
     stations = np.load(f"/app/Windy/Station/stations4_val.npy")
     stations = torch.from_numpy(stations)
     # gfs_field
-    gfs_field = gfs_field[:78]
+    gfs_field = gfs_field[-78:]
 
     gfs_field = torch.stack((gfs_field, gfs_field, gfs_field, gfs_field))
-    stations = stations[:, :72]
+    stations = stations[:, -72:]
 
     print(stations.shape)  # torch.Size([4, 72, 3])
     print(gfs_field.shape)  # torch.Size([4, 78, 14, 80, 80])
@@ -178,6 +177,7 @@ if __name__ == '__main__':
     lat_bounds = [33.75, 53.5, 80]
     lon_bounds = [3.5, 23.25, 80]
     wind_forecast_channels = [9, 10, 11]
-    pred = inference_model(gfs_field, stations, './epochs/unilstm_best_epoch_88.pth', wind_forecast_channels
-                           , station_coords, lat_bounds, lon_bounds)
+    # print(gfs_field[0, -6:, 9, 35:45, 35:45], 'before transform')
+    pred = inference_model(gfs_field, stations, './epochs_transformer/transformer_epoch_106.pth', wind_forecast_channels
+                           , station_coords=None, lat_bounds=None, lon_bounds=None)
     print(pred)
